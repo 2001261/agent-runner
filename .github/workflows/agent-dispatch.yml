@@ -33,6 +33,14 @@ on:
         description: "job 超时分钟数，GitHub 硬上限 360（6 小时）"
         type: string
         default: "360"
+      cache_key:
+        description: "跨 run 状态缓存键（[A-Za-z0-9._-]）；非空时用 actions/cache 复用 ~/.gha-state，存唯一键 <key>-<run_id>、按前缀恢复最近一次"
+        type: string
+        default: ""
+      cache_paths:
+        description: "额外要缓存的路径，逗号或换行分隔；~/.gha-state 与已存在的常见工具缓存目录始终包含"
+        type: string
+        default: ""
 
 # 最小权限：只需要 checkout 读代码。推分支由本地 git 完成，不需要 contents:write。
 permissions:
@@ -125,6 +133,50 @@ jobs:
           echo "任务目录内容："
           ( cd "$WORK" && find . -maxdepth 2 -print )
 
+      # 状态目录：任务跨 run 复用的家。不论缓存开没开都建出来并写进 GHA_STATE_DIR，
+      # 让任务脚本始终可以用 "$GHA_STATE_DIR" 而不必判断。
+      - name: Prepare state
+        id: pstate
+        env:
+          IN_CACHE_PATHS: ${{ inputs.cache_paths }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          STATE_DIR="$HOME/.gha-state"
+          mkdir -p "$STATE_DIR"
+          echo "GHA_STATE_DIR=$STATE_DIR" >> "$GITHUB_ENV"
+          echo "state_dir=$STATE_DIR" >> "$GITHUB_OUTPUT"
+
+          # 汇总进缓存的路径：状态目录 + 已存在的常见工具缓存 + 用户额外指定。
+          # 只放真实存在的路径，不存在的会让 cache 步骤白 warn 一次。
+          # 这个列表必须与 gha_runner/core.py 的 DEFAULT_CACHE_SUBDIRS 保持一致。
+          {
+            echo "paths<<EOF_PATHS"
+            echo "$STATE_DIR"
+            for sub in .cache/pip .npm .cache/uv .cargo/registry .cache/go-build .m2 .gradle/caches .cache/yarn; do
+              if [ -d "$HOME/$sub" ]; then echo "$HOME/$sub"; fi
+            done
+            printf '%s' "$IN_CACHE_PATHS" | tr ',;' '\n\n' | while IFS= read -r p; do
+              p=$(printf '%s' "$p" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+              if [ -n "$p" ]; then echo "$p"; fi
+            done
+            echo "EOF_PATHS"
+          } >> "$GITHUB_OUTPUT"
+          echo "state 目录：$STATE_DIR"
+
+      # 存唯一键 <key>-<run_id>、按前缀 <key>- 恢复最近一次 ——
+      # actions/cache/save 撞已存在的 key 会直接失败（"Cache already exists"），
+      # 这是官方推荐解法；旧条目靠 7 天过期 + 仓库 10GB LRU 自动回收。
+      - name: Restore state
+        if: inputs.cache_key != ''
+        id: restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.pstate.outputs.paths }}
+          key: ${{ inputs.cache_key }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ inputs.cache_key }}-
+
       - name: Run task
         id: task
         shell: bash
@@ -195,6 +247,10 @@ jobs:
         env:
           IN_TASK_ID: ${{ inputs.task_id }}
           IN_RUNNER: ${{ inputs.runner }}
+          IN_CACHE_KEY: ${{ inputs.cache_key }}
+          IN_CACHE_HIT: ${{ steps.restore.outputs.cache-hit }}
+          IN_RESTORED_KEY: ${{ steps.restore.outputs.cache-matched-key }}
+          IN_CACHED_PATHS: ${{ steps.pstate.outputs.paths }}
         shell: bash
         run: |
           # 同 Run task：shell: bash 会带上 -e，这里是 if: always() 的兜底步骤，
@@ -216,11 +272,14 @@ jobs:
           export GHA_FINISHED
           echo "GHA_FINISHED=$GHA_FINISHED" >> "$GITHUB_ENV"
 
-          # JSON 用 python3 组装：stdout_tail/stderr_tail 是任意文本，
+          # JSON 用 python 组装：stdout_tail/stderr_tail 是任意文本，
           # 手工拼 JSON 处理不好引号、换行和控制字符。
-          # python3 在 ubuntu / macos / windows 托管 runner 上都预装。
-          if command -v python3 >/dev/null 2>&1; then
-            python3 - <<'PY'
+          # windows-latest 上预装的解释器只有 python 没有 python3，两个都试。
+          PYBIN=""
+          if command -v python3 >/dev/null 2>&1; then PYBIN=python3;
+          elif command -v python >/dev/null 2>&1; then PYBIN=python; fi
+          if [ -n "$PYBIN" ]; then
+            "$PYBIN" - <<'PY'
           import json, os, platform, shutil, subprocess
 
           res = os.environ["GHA_RES"]
@@ -254,6 +313,9 @@ jobs:
               if v.isdigit():
                   cores = int(v)
                   break
+          if not cores:
+              # Windows 兜底：nproc/sysctl 都不存在时用 python 自己数
+              cores = os.cpu_count() or 0
 
           mem_mb = 0
           m = sh("awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo")
@@ -263,6 +325,11 @@ jobs:
                   m = str(int(m) // (1024 * 1024))
           if m.isdigit():
               mem_mb = int(m)
+          if not mem_mb:
+              # Windows 兜底：/proc 与 sysctl 都没有，走 PowerShell CIM
+              v = sh('powershell -NoProfile -Command "(Get-CimInstance Win32_OperatingSystem).TotalVisibleMemorySize"')
+              if v.isdigit():
+                  mem_mb = int(v) // 1024
 
           try:
               disk_gb = shutil.disk_usage(os.getcwd()).free // (1024 ** 3)
@@ -283,6 +350,18 @@ jobs:
           finished = int(os.environ.get("GHA_FINISHED", "0") or 0)
           task_id = os.environ.get("IN_TASK_ID", "")
 
+          cache_key = os.environ.get("IN_CACHE_KEY", "")
+          state_dir = os.environ.get("GHA_STATE_DIR", "")
+          state_bytes = 0
+          if cache_key and state_dir and os.path.isdir(state_dir):
+              for root, _dirs, files in os.walk(state_dir):
+                  for fn in files:
+                      try:
+                          state_bytes += os.path.getsize(os.path.join(root, fn))
+                      except OSError:
+                          pass
+          cached_paths = [p for p in os.environ.get("IN_CACHED_PATHS", "").splitlines() if p.strip()]
+
           out_files = []
           odir = res + "/output"
           for root, _dirs, files in os.walk(odir):
@@ -295,7 +374,7 @@ jobs:
                   out_files.append({"path": os.path.relpath(fp, odir), "bytes": sz})
 
           manifest = {
-              "schema": 1,
+              "schema": 2,
               "task_id": task_id,
               # 注意：status / conclusion / run_id / run_url 不在这里 ——
               # runner 跑的时候 run 还没结束，写不出终态。那些字段在同目录的
@@ -321,6 +400,15 @@ jobs:
               },
               "outputs": outputs,
               "output_files": out_files,
+              # 状态复用小节（schema 2 新增）：本地 describe_state() 按这些字段渲染
+              "state": {
+                  "cache_key": cache_key,
+                  "cache_hit": os.environ.get("IN_CACHE_HIT", "") == "true",
+                  "restored_key": os.environ.get("IN_RESTORED_KEY", ""),
+                  "state_dir": state_dir,
+                  "state_dir_bytes": state_bytes,
+                  "cached_paths": cached_paths,
+              },
               "artifacts": ["result-" + task_id] if task_id else [],
               "stdout_bytes": len(so),
               "stderr_bytes": len(se),
@@ -342,6 +430,17 @@ jobs:
               "$(wc -c < "$RES/stderr.log" | tr -d ' ')" > "$RES/manifest.json"
             echo "::warning::runner 上没有 python3，manifest.json 是最小版本"
           fi
+
+      # always()：任务失败 / 被强杀时状态同样值得留下（续跑正依赖它）。
+      # continue-on-error：缓存保存失败（体积超限、服务抖动）不该拖垮整个 run。
+      - name: Save state
+        if: always() && inputs.cache_key != ''
+        id: save
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.pstate.outputs.paths }}
+          key: ${{ inputs.cache_key }}-${{ github.run_id }}
 
       - name: Job summary
         id: summary
