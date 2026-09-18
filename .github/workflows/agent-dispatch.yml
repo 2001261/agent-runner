@@ -127,9 +127,19 @@ jobs:
           esac
           chmod +x "$WORK/$entry" 2>/dev/null || true
 
+          # python 入口的解释器名因平台而异：windows-latest 上只有 python 没有 python3。
+          # 在 Prepare 阶段探测好，Run task 直接用 $GHA_PYBIN，不在执行时才碰运气。
+          pybin=""
+          if [ "$kind" = "python3" ]; then
+            if command -v python3 >/dev/null 2>&1; then pybin=python3;
+            elif command -v python >/dev/null 2>&1; then pybin=python; fi
+            if [ -z "$pybin" ]; then echo "::error::任务需要 python，但 runner 上 python3/python 都没有"; exit 1; fi
+          fi
+
           {
             echo "GHA_ENTRY=$entry"
             echo "GHA_SHELL_KIND=$kind"
+            echo "GHA_PYBIN=$pybin"
           } >> "$GITHUB_ENV"
           echo "入口=$entry  解释器=$kind"
           echo "任务目录内容："
@@ -202,7 +212,7 @@ jobs:
 
           interp=""
           case "$GHA_SHELL_KIND" in
-            python3) interp="python3" ;;
+            python3) interp="$GHA_PYBIN" ;;   # Prepare task 已按平台探测好（windows 上是 python）
             node)    interp="node" ;;
           esac
 
