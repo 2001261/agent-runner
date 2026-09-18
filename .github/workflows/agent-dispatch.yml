@@ -85,7 +85,9 @@ jobs:
           if [ -n "$IN_PAYLOAD_B64" ]; then
             echo "::group::解码内联 payload（${#IN_PAYLOAD_B64} 字符 base64）"
             printf '%s' "$IN_PAYLOAD_B64" | base64 -d > "$BUNDLE" || { echo "::error::base64 解码失败"; exit 1; }
-            tar xzf "$BUNDLE" -C "$WORK" || { echo "::error::tar 解包失败"; exit 1; }
+            # Windows 的 GNU tar 会把 "D:\..." 的盘符当成远程主机名（host:path 语法），
+            # 报 "Cannot connect to D: resolve failed"。进到目录里用相对路径解包，绕开盘符。
+            ( cd "$RUNNER_TEMP" && tar xzf gha-bundle.tgz -C gha-task ) || { echo "::error::tar 解包失败"; exit 1; }
             echo "任务来源：内联 payload_b64"
             echo "::endgroup::"
           elif [ -n "$IN_TASK_PATH" ]; then
@@ -280,7 +282,14 @@ jobs:
           elif command -v python >/dev/null 2>&1; then PYBIN=python; fi
           if [ -n "$PYBIN" ]; then
             "$PYBIN" - <<'PY'
-          import json, os, platform, shutil, subprocess
+          import json, os, platform, shutil, subprocess, sys
+
+          # Windows runner 的 stdout 默认是 cp1252，print 中文直接 UnicodeEncodeError。
+          # 重配成 utf-8 + replace，打印崩了也不能带走整个 manifest 步骤。
+          try:
+              sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+          except Exception:
+              pass
 
           res = os.environ["GHA_RES"]
 
