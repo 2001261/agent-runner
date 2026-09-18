@@ -200,7 +200,10 @@ jobs:
           if [ ! -f "$RES/exit_code" ]; then echo "-1" > "$RES/exit_code"; fi
           if [ ! -f "$RES/stdout.log" ]; then : > "$RES/stdout.log"; fi
           if [ ! -f "$RES/stderr.log" ]; then : > "$RES/stderr.log"; fi
-          echo "GHA_FINISHED=$(date -u +%s)" >> "$GITHUB_ENV"
+          # GITHUB_ENV 只对【后续】步骤可见，本步骤自己要用的话必须同时 export
+          GHA_FINISHED=$(date -u +%s)
+          export GHA_FINISHED
+          echo "GHA_FINISHED=$GHA_FINISHED" >> "$GITHUB_ENV"
 
           # JSON 用 python3 组装：stdout_tail/stderr_tail 是任意文本，
           # 手工拼 JSON 处理不好引号、换行和控制字符。
@@ -283,11 +286,9 @@ jobs:
           manifest = {
               "schema": 1,
               "task_id": task_id,
-              # 下面 4 个字段 runner 侧无法知道终态，由本地 `gha fetch` 从 API 回填
-              "status": "",
-              "conclusion": "",
-              "run_id": 0,
-              "run_url": "",
+              # 注意：status / conclusion / run_id / run_url 不在这里 ——
+              # runner 跑的时候 run 还没结束，写不出终态。那些字段在同目录的
+              # run.json 里，由本地 `gha fetch` 从 API 取。artifact 内容保持只读不改。
               "exit_code": code,
               "task_ok": (os.environ.get("GHA_TASK_OK") == "true") and code == 0,
               "runner": os.environ.get("IN_RUNNER", ""),
