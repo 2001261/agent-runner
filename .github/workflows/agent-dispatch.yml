@@ -217,6 +217,9 @@ jobs:
           esac
 
           echo "=== 任务开始 $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
+          # Windows runner 的 python 默认 stdout 是 cp1252，任务 print 中文会直接崩。
+          # 统一强制 UTF-8：Linux/macOS 本来就是 UTF-8，无副作用；Windows 上救任务一命。
+          export PYTHONIOENCODING=utf-8
           (
             cd "$GHA_TASK_DIR" || exit 127
             if [ -n "$interp" ]; then
