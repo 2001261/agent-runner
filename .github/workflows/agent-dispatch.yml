@@ -410,9 +410,13 @@ jobs:
               "outputs": outputs,
               "output_files": out_files,
               # 状态复用小节（schema 2 新增）：本地 describe_state() 按这些字段渲染
+              # 注意 cache_hit 的判定：我们存的是唯一键 <key>-<run_id>，restore 的
+              # cache-hit 只在精确命中时为 true，前缀命中时永远是 false ——
+              # 所以真正的"恢复到状态了没有"要看 cache-matched-key 是否非空。
               "state": {
                   "cache_key": cache_key,
-                  "cache_hit": os.environ.get("IN_CACHE_HIT", "") == "true",
+                  "cache_hit": (os.environ.get("IN_CACHE_HIT", "") == "true"
+                                or bool(os.environ.get("IN_RESTORED_KEY", ""))),
                   "restored_key": os.environ.get("IN_RESTORED_KEY", ""),
                   "state_dir": state_dir,
                   "state_dir_bytes": state_bytes,
