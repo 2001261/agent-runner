@@ -129,8 +129,10 @@ jobs:
         id: task
         shell: bash
         run: |
-          # 故意不开 -e：任务的退出码要被记录下来，而不是让 step 直接红掉。
-          # 这样后面 if: always() 的 manifest 步骤才能拿到真实 exit_code。
+          # 关键：声明了 shell: bash 后，GitHub 是用 `bash --noprofile --norc -e -o pipefail`
+          # 调用本脚本的 —— -e 已经开着。必须显式 set +e，否则任务一非零退出，
+          # 下面的 code=$? / 写 exit_code / cat 日志全都不会执行，manifest 只能拿到 -1。
+          set +e
           set -u
           RES="$GHA_RES"
           : > "$RES/stdout.log"
@@ -182,9 +184,10 @@ jobs:
           else
             echo "GHA_TASK_OK=true" >> "$GITHUB_ENV"
           fi
-          # step 本身始终成功：run 的 conclusion 由任务退出码写进 manifest，
-          # 而不是靠 step 红掉来表达 —— 红了反而拿不到 artifact。
-          exit 0
+          # 如实以任务的退出码结束本步骤 —— run 的 conclusion 要反映真实结果，
+          # 否则失败任务在 run 列表里显示成 success，agent 会误判。
+          # 结果不丢：manifest / summary / upload 三步都挂了 if: always()。
+          exit "$code"
 
       - name: Build manifest
         id: manifest
@@ -194,13 +197,21 @@ jobs:
           IN_RUNNER: ${{ inputs.runner }}
         shell: bash
         run: |
+          # 同 Run task：shell: bash 会带上 -e，这里是 if: always() 的兜底步骤，
+          # 绝不能因为某条命令非零就中止，否则连 manifest 都产不出来。
+          set +e
           set -u
           RES="$GHA_RES"
           mkdir -p "$RES"
-          if [ ! -f "$RES/exit_code" ]; then echo "-1" > "$RES/exit_code"; fi
+          if [ ! -f "$RES/exit_code" ]; then
+            # 走到这里说明 Run task 没能写下退出码 —— 通常是 job 被强制终止（超时/取消）
+            echo "-1" > "$RES/exit_code"
+            export GHA_EXIT_CODE_MISSING=true
+            echo "GHA_EXIT_CODE_MISSING=true" >> "$GITHUB_ENV"
+          fi
           if [ ! -f "$RES/stdout.log" ]; then : > "$RES/stdout.log"; fi
           if [ ! -f "$RES/stderr.log" ]; then : > "$RES/stderr.log"; fi
-          # GITHUB_ENV 只对【后续】步骤可见，本步骤自己要用的话必须同时 export
+          # GITHUB_ENV 只对后续步骤可见，本步骤自己要用的话必须同时 export
           GHA_FINISHED=$(date -u +%s)
           export GHA_FINISHED
           echo "GHA_FINISHED=$GHA_FINISHED" >> "$GITHUB_ENV"
@@ -290,6 +301,9 @@ jobs:
               # runner 跑的时候 run 还没结束，写不出终态。那些字段在同目录的
               # run.json 里，由本地 `gha fetch` 从 API 取。artifact 内容保持只读不改。
               "exit_code": code,
+              # code == -1 且 recorded 为 false，说明 Run task 步骤被强制终止
+              # （超时 / 取消），任务真实退出码无从记录
+              "exit_code_recorded": os.environ.get("GHA_EXIT_CODE_MISSING") != "true",
               "task_ok": (os.environ.get("GHA_TASK_OK") == "true") and code == 0,
               "runner": os.environ.get("IN_RUNNER", ""),
               "runner_os": os.environ.get("RUNNER_OS", ""),
@@ -337,6 +351,7 @@ jobs:
           IN_RUNNER: ${{ inputs.runner }}
         shell: bash
         run: |
+          set +e   # 同前：if: always() 的兜底步骤不能被 -e 中止
           set -u
           RES="$GHA_RES"
           code=$(cat "$RES/exit_code" 2>/dev/null || echo "?")
