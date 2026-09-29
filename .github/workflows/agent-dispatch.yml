@@ -224,8 +224,13 @@ jobs:
 
           # ---- 凭证传递围栏：有 _gha/credinject.py 就经它包装启动（bundle 与分支投递
           #      都会带上这份支持文件）。它负责：按 declared.json 白名单把仓库 secret
-          #      JSON export 成原生 env 名、对全部值发 ::add-mask::、原样传播退出码。
-          #      解释器发现沿用现状：ubuntu/macos 用 python3，Windows 用 python / py -3。
+          #      JSON export 成原生 env 名、原样传播退出码。解释器发现沿用现状：
+          #      ubuntu/macos 用 python3，Windows 用 python / py -3。
+          #      掩码只在这里的 --mask-only 预跑步骤注册（走步骤日志，同一 job 注册
+          #      一次全程有效）——包装启动的 stdout 会重定向进 stdout.log 随 artifact
+          #      上传，credinject 运行模式【不再】往那条流里打 ::add-mask::（实测教训：
+          #      掩码声明自己成了泄露源；且平台掩码本来就管不到我们自己上传的 artifact，
+          #      捕获日志由后面的 Redact captured logs 步骤脱敏）。
           WRAP=()
           if [ -f "$GHA_TASK_DIR/_gha/credinject.py" ]; then
             if [ -n "$GHA_PYBIN" ]; then WRAP=("$GHA_PYBIN")
@@ -242,9 +247,9 @@ jobs:
               fi
               echo "::warning::找不到 python，凭证围栏跳过（GHA_TASK_SECRETS 为空，直通启动）"
             elif [ -n "$GHA_TASK_SECRETS" ]; then
-              # 先把掩码声明送进【步骤日志】（此刻任务输出还没开始），保证掩码先于
-              # 任何任务输出被 runner 命令解析器注册。包装启动时 credinject 会再发
-              # 一遍 —— add-mask 幂等，重复无害。
+              # 掩码注册：只在这一步做，输出走【步骤日志】（不重定向）——此刻任务
+              # 任何输出还没开始，同一 job 内注册一次全程有效。credinject 运行模式
+              # 不再重复发掩码（见上方围栏注释：打进 stdout.log = 自己泄露）。
               "${WRAP[@]}" "$GHA_TASK_DIR/_gha/credinject.py" --mask-only
             fi
           elif [ -n "$GHA_TASK_SECRETS" ]; then
@@ -498,6 +503,50 @@ jobs:
             echo "::warning::runner 上没有 python3，manifest.json 是最小版本"
           fi
 
+      # ---- 凭证传递围栏·日志脱敏（实测教训换来的步骤）：GitHub 的 ::add-mask::
+      #      只作用于平台发布的步骤日志，管不到我们重定向捕获、随 artifact 上传的
+      #      stdout.log / stderr.log —— 任务 echo 一次凭证，明文就进 artifact（公开
+      #      仓库的 artifact 任何人无认证可下载）。所以在扫描与上传之前，用 blob 里
+      #      全部字符串叶子（含嵌套、多行值按行拆）对被捕获文件做字面替换 ***。
+      #      脱敏逻辑在 _gha/credinject.py（--redact），与掩码共用同一套叶子收集。
+      #      顺序：脱敏在前（处理"我们知道的凭证"），扫描在后（兜底"运行期才产生的、
+      #      不在 blob 里的敏感值"）。manifest 的 stdout_tail/stderr_tail 一并脱敏。
+      - name: Redact captured logs
+        id: redact
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          set -u
+          RES="${GHA_RES:-}"
+          MOD="${GHA_TASK_DIR:-}/_gha/credinject.py"
+          if [ -z "$RES" ] || [ ! -d "$RES" ]; then
+            echo "没有 result 目录可脱敏（任务未启动），跳过"
+            exit 0
+          fi
+          if [ -z "${GHA_TASK_SECRETS:-}" ]; then
+            echo "无凭证 blob，无需脱敏"
+            exit 0
+          fi
+          if [ ! -f "$MOD" ]; then
+            echo "::warning::任务包里没有 _gha/credinject.py，跳过日志脱敏（artifact 扫描兜底）"
+            exit 0
+          fi
+          PYW=()
+          if command -v python3 >/dev/null 2>&1; then PYW=(python3)
+          elif command -v python >/dev/null 2>&1; then PYW=(python)
+          elif command -v py >/dev/null 2>&1; then PYW=(py -3)
+          fi
+          if [ ${#PYW[@]} -eq 0 ]; then
+            echo "::warning::runner 上没有 python，跳过日志脱敏（artifact 扫描兜底）"
+            exit 0
+          fi
+          # credinject --redact 只报"替换了几处 + 文件路径"，绝不回显值；
+          # 任何文件级失败也不阻断（本步骤恒退 0，剩下交给扫描兜底）
+          "${PYW[@]}" "$MOD" --redact \
+            "$RES/stdout.log" "$RES/stderr.log" "$RES/manifest.json"
+          exit 0
+
       # always()：任务失败 / 被强杀时状态同样值得留下（续跑正依赖它）。
       # continue-on-error：缓存保存失败（体积超限、服务抖动）不该拖垮整个 run。
       - name: Save state
@@ -552,11 +601,14 @@ jobs:
           } > "$GITHUB_STEP_SUMMARY"
           echo "job summary 已写入"
 
-      # ---- 凭证传递围栏（下游兜底）：artifact 上传前扫描 output/。
+      # ---- 凭证传递围栏（下游兜底）：artifact 上传前扫描【整个待上传载荷】——
+      #      result 目录下所有会进 artifact 的文件：output/ + stdout.log + stderr.log
+      #      + manifest.json。脱敏（Redact captured logs）在前处理"我们知道的凭证"，
+      #      这里兜底"运行期才产生的、不在 blob 里的敏感值"。
       #      命中只报 文件:行号，绝不回显值；命中即 ::error:: 并以非零结束本步骤，
       #      下面的 Upload 靠 steps.outscan.outcome 跳过 —— 但 manifest / summary 等
       #      always() 步骤不受影响（失败任务也要保留部分产物与现场，别破坏这语义）。
-      - name: Scan output for secrets
+      - name: Scan artifact payload
         id: outscan
         if: always()
         shell: bash
@@ -565,8 +617,8 @@ jobs:
           set -u
           RES="${GHA_RES:-}"
           MOD="${GHA_TASK_DIR:-}/_gha/secrets.py"
-          if [ -z "$RES" ] || [ ! -d "$RES/output" ]; then
-            echo "没有 output/ 可扫描（任务未启动或目录不存在），跳过"
+          if [ -z "$RES" ] || [ ! -d "$RES" ]; then
+            echo "没有 result 目录可扫描（任务未启动或目录不存在），跳过"
             exit 0
           fi
           if [ ! -f "$MOD" ]; then
@@ -579,12 +631,12 @@ jobs:
           elif command -v py >/dev/null 2>&1; then PYW=(py -3)
           fi
           if [ ${#PYW[@]} -eq 0 ]; then
-            echo "::warning::runner 上没有 python，output/ 未经扫描照常上传"
+            echo "::warning::runner 上没有 python，待上传载荷未经扫描照常上传"
             exit 0
           fi
           # 扫描逻辑复用 _gha/secrets.py（submit 前置扫描的同款规则，铁律也是只报
           # 文件:行号不回显值）。按文件路径加载，避免 import secrets 遮蔽标准库同名模块。
-          "${PYW[@]}" - "$MOD" "$RES/output" "$RES/manifest.json" <<'PY'
+          "${PYW[@]}" - "$MOD" "$RES" "$RES/manifest.json" <<'PY'
           import importlib.util
           import json
           import sys
@@ -596,22 +648,22 @@ jobs:
           except Exception:
               pass
 
-          mod_path, out_dir, manifest_path = sys.argv[1], sys.argv[2], sys.argv[3]
+          mod_path, payload_dir, manifest_path = sys.argv[1], sys.argv[2], sys.argv[3]
           spec = importlib.util.spec_from_file_location("gha_secrets_scan", mod_path)
           mod = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(mod)
 
-          content_hits, name_hits = mod.scan_secrets(out_dir)
+          content_hits, name_hits = mod.scan_secrets(payload_dir)
           hits = content_hits + name_hits
           if not hits:
-              print("artifact 上传前扫描通过：output/ 未命中凭据特征")
+              print("artifact 上传前扫描通过：待上传载荷未命中凭据特征")
               sys.exit(0)
 
           for h in content_hits:
               print("    内容命中: %s" % h)
           for h in name_hits:
               print("    文件命中: %s" % h)
-          print("::error::output/ 凭据扫描命中 %d 处（只报文件:行号，值未回显）"
+          print("::error::待上传载荷凭据扫描命中 %d 处（只报文件:行号，值未回显）"
                 " —— 已阻止 artifact 上传；任务输出请经凭证传递围栏传递"
                 "（见 SKILL.md）" % len(hits))
 
