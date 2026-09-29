@@ -603,8 +603,11 @@ jobs:
 
       # ---- 凭证传递围栏（下游兜底）：artifact 上传前扫描【整个待上传载荷】——
       #      result 目录下所有会进 artifact 的文件：output/ + stdout.log + stderr.log
-      #      + manifest.json。脱敏（Redact captured logs）在前处理"我们知道的凭证"，
-      #      这里兜底"运行期才产生的、不在 blob 里的敏感值"。
+      #      + manifest.json。双通道并行：正则特征库兜"运行期才产生的、不在 blob 里
+      #      的敏感值"；已注册凭证值字面比对兜"任务把自己拿到的凭证写进产物"
+      #      （实测 fence-c 只有后者能拦住）。脱敏（Redact captured logs）在前，
+      #      日志类文件正常情况下已不含值、不会命中；output/ 是用户产物【不做静默改写】，
+      #      命中就拦下上传（fail-closed）。
       #      命中只报 文件:行号，绝不回显值；命中即 ::error:: 并以非零结束本步骤，
       #      下面的 Upload 靠 steps.outscan.outcome 跳过 —— 但 manifest / summary 等
       #      always() 步骤不受影响（失败任务也要保留部分产物与现场，别破坏这语义）。
@@ -634,11 +637,21 @@ jobs:
             echo "::warning::runner 上没有 python，待上传载荷未经扫描照常上传"
             exit 0
           fi
-          # 扫描逻辑复用 _gha/secrets.py（submit 前置扫描的同款规则，铁律也是只报
-          # 文件:行号不回显值）。按文件路径加载，避免 import secrets 遮蔽标准库同名模块。
-          "${PYW[@]}" - "$MOD" "$RES" "$RES/manifest.json" <<'PY'
+          # 扫描双通道，同一份待上传载荷跑两遍，命中同等处理（都只报 文件:行号，绝不回显值）：
+          #   1) 正则特征库 —— _gha/secrets.py（submit 前置扫描的同款规则），兜运行期新产生的敏感值
+          #   2) 已注册凭证值字面比对 —— _gha/credinject.py 的 find_literal_leaks（与 --redact
+          #      同一套替换集），兜"任务把自己拿到的凭证写进 output/ 产物"（实测 fence-c：
+          #      正则对不在特征库里的值零感知，明文凭证随 artifact 进了公开仓库）
+          # 两个模块都按文件路径加载，避免 import secrets 遮蔽标准库同名模块。
+          CJ="${GHA_TASK_DIR:-}/_gha/credinject.py"
+          if [ ! -f "$MOD" ] && [ ! -f "$CJ" ]; then
+            echo "::warning::任务包里没有 _gha/secrets.py 与 _gha/credinject.py，跳过 artifact 上传前扫描"
+            exit 0
+          fi
+          "${PYW[@]}" - "$MOD" "$CJ" "$RES" "$RES/manifest.json" <<'PY'
           import importlib.util
           import json
+          import os
           import sys
 
           # Windows runner 的 stdout 默认 cp1252，print 中文直接 UnicodeEncodeError ——
@@ -648,24 +661,47 @@ jobs:
           except Exception:
               pass
 
-          mod_path, payload_dir, manifest_path = sys.argv[1], sys.argv[2], sys.argv[3]
-          spec = importlib.util.spec_from_file_location("gha_secrets_scan", mod_path)
-          mod = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(mod)
+          mod_path, cj_path, payload_dir, manifest_path = (sys.argv[1], sys.argv[2],
+                                                           sys.argv[3], sys.argv[4])
 
-          content_hits, name_hits = mod.scan_secrets(payload_dir)
-          hits = content_hits + name_hits
+          def load(name, path):
+              # 旧包可能只缺一半：调用方已保证至少一个存在；缺的那个通道降级为 warning
+              if not os.path.isfile(path):
+                  return None
+              spec = importlib.util.spec_from_file_location(name, path)
+              m = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(m)
+              return m
+
+          content_hits, name_hits = [], []
+          sec_mod = load("gha_secrets_scan", mod_path)
+          if sec_mod is not None:
+              content_hits, name_hits = sec_mod.scan_secrets(payload_dir)
+
+          literal_hits = []
+          blob = os.environ.get("GHA_TASK_SECRETS", "")
+          if blob.strip():
+              cj_mod = load("gha_credinject_scan", cj_path)
+              if cj_mod is not None:
+                  literal_hits = cj_mod.find_literal_leaks(payload_dir, blob)
+              else:
+                  print("::warning::任务包里没有 _gha/credinject.py，"
+                        "已注册凭证值的字面比对通道未执行")
+
+          hits = content_hits + name_hits + literal_hits
           if not hits:
-              print("artifact 上传前扫描通过：待上传载荷未命中凭据特征")
+              print("artifact 上传前扫描通过：待上传载荷未命中凭据特征与已注册凭证值")
               sys.exit(0)
 
           for h in content_hits:
               print("    内容命中: %s" % h)
           for h in name_hits:
               print("    文件命中: %s" % h)
-          print("::error::待上传载荷凭据扫描命中 %d 处（只报文件:行号，值未回显）"
-                " —— 已阻止 artifact 上传；任务输出请经凭证传递围栏传递"
-                "（见 SKILL.md）" % len(hits))
+          for h in literal_hits:
+              print("    凭证值字面命中: %s" % h)
+          print("::error::待上传载荷凭据扫描命中 %d 处（正则特征 + 已注册凭证值字面比对，"
+                "只报文件:行号，值未回显） —— 已阻止 artifact 上传；任务输出请经凭证传递围栏"
+                "传递（见 SKILL.md）" % len(hits))
 
           # 在 manifest 里记录阻止原因；manifest 可能还没生成（Build manifest 挂了），
           # 尽力而为即可，写不进去也不影响"阻止上传"本身。
