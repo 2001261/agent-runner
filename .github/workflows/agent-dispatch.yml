@@ -52,12 +52,6 @@ jobs:
     # timeout_minutes 是 string 类型的 input，表达式里要 fromJSON 转数字。
     # CLI 侧已校验范围；这里的 || '360' 兜住 input 缺失的情况。
     timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || '360') }}
-    # 凭证传递围栏：仓库 secret 映射进 job env（约定单名，值是 JSON 对象）。
-    # secret 不存在时为空串 —— _gha/credinject.py 对空 blob 是透明直通，行为不变。
-    # 值只经 env 传给脚本（与 inputs 同款防注入纪律），由 credinject 按白名单 export；
-    # GitHub 对 repo secret 的日志掩码在这里自动生效。
-    env:
-      GHA_TASK_SECRETS: ${{ secrets.GHA_TASK_SECRETS }}
     steps:
       # 所有 input 一律通过 env 传进脚本，绝不把 ${{ inputs.x }} 直接插值到 run: 里 ——
       # 后者是 GitHub 明确警告的脚本注入向量（input 内容会被当成 shell 代码执行）。
@@ -222,53 +216,13 @@ jobs:
             node)    interp="node" ;;
           esac
 
-          # ---- 凭证传递围栏：有 _gha/credinject.py 就经它包装启动（bundle 与分支投递
-          #      都会带上这份支持文件）。它负责：按 declared.json 白名单把仓库 secret
-          #      JSON export 成原生 env 名、原样传播退出码。解释器发现沿用现状：
-          #      ubuntu/macos 用 python3，Windows 用 python / py -3。
-          #      掩码只在这里的 --mask-only 预跑步骤注册（走步骤日志，同一 job 注册
-          #      一次全程有效）——包装启动的 stdout 会重定向进 stdout.log 随 artifact
-          #      上传，credinject 运行模式【不再】往那条流里打 ::add-mask::（实测教训：
-          #      掩码声明自己成了泄露源；且平台掩码本来就管不到我们自己上传的 artifact，
-          #      捕获日志由后面的 Redact captured logs 步骤脱敏）。
-          WRAP=()
-          if [ -f "$GHA_TASK_DIR/_gha/credinject.py" ]; then
-            if [ -n "$GHA_PYBIN" ]; then WRAP=("$GHA_PYBIN")
-            elif command -v python3 >/dev/null 2>&1; then WRAP=(python3)
-            elif command -v python >/dev/null 2>&1; then WRAP=(python)
-            elif command -v py >/dev/null 2>&1; then WRAP=(py -3)
-            fi
-            if [ ${#WRAP[@]} -eq 0 ]; then
-              if [ -n "$GHA_TASK_SECRETS" ]; then
-                echo "::error::任务包要求凭证注入，但 runner 上找不到 python —— 拒绝在未掩码/未注入状态下启动任务"
-                echo "-1" > "$RES/exit_code"
-                echo "GHA_TASK_OK=false" >> "$GITHUB_ENV"
-                exit 1
-              fi
-              echo "::warning::找不到 python，凭证围栏跳过（GHA_TASK_SECRETS 为空，直通启动）"
-            elif [ -n "$GHA_TASK_SECRETS" ]; then
-              # 掩码注册：只在这一步做，输出走【步骤日志】（不重定向）——此刻任务
-              # 任何输出还没开始，同一 job 内注册一次全程有效。credinject 运行模式
-              # 不再重复发掩码（见上方围栏注释：打进 stdout.log = 自己泄露）。
-              "${WRAP[@]}" "$GHA_TASK_DIR/_gha/credinject.py" --mask-only
-            fi
-          elif [ -n "$GHA_TASK_SECRETS" ]; then
-            echo "::warning::任务包里没有 _gha/credinject.py（旧版 gha 打的包？），凭证未注入、日志未加掩码"
-          fi
-
           echo "=== 任务开始 $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
           # Windows runner 的 python 默认 stdout 是 cp1252，任务 print 中文会直接崩。
           # 统一强制 UTF-8：Linux/macOS 本来就是 UTF-8，无副作用；Windows 上救任务一命。
           export PYTHONIOENCODING=utf-8
           (
             cd "$GHA_TASK_DIR" || exit 127
-            if [ ${#WRAP[@]} -gt 0 ] && [ -f "$GHA_TASK_DIR/_gha/credinject.py" ]; then
-              if [ -n "$interp" ]; then
-                "${WRAP[@]}" "$GHA_TASK_DIR/_gha/credinject.py" -- "$interp" "./$GHA_ENTRY"
-              else
-                "${WRAP[@]}" "$GHA_TASK_DIR/_gha/credinject.py" -- bash "./$GHA_ENTRY"
-              fi
-            elif [ -n "$interp" ]; then
+            if [ -n "$interp" ]; then
               "$interp" "./$GHA_ENTRY"
             else
               bash "./$GHA_ENTRY"
@@ -503,50 +457,6 @@ jobs:
             echo "::warning::runner 上没有 python3，manifest.json 是最小版本"
           fi
 
-      # ---- 凭证传递围栏·日志脱敏（实测教训换来的步骤）：GitHub 的 ::add-mask::
-      #      只作用于平台发布的步骤日志，管不到我们重定向捕获、随 artifact 上传的
-      #      stdout.log / stderr.log —— 任务 echo 一次凭证，明文就进 artifact（公开
-      #      仓库的 artifact 任何人无认证可下载）。所以在扫描与上传之前，用 blob 里
-      #      全部字符串叶子（含嵌套、多行值按行拆）对被捕获文件做字面替换 ***。
-      #      脱敏逻辑在 _gha/credinject.py（--redact），与掩码共用同一套叶子收集。
-      #      顺序：脱敏在前（处理"我们知道的凭证"），扫描在后（兜底"运行期才产生的、
-      #      不在 blob 里的敏感值"）。manifest 的 stdout_tail/stderr_tail 一并脱敏。
-      - name: Redact captured logs
-        id: redact
-        if: always()
-        shell: bash
-        run: |
-          set +e
-          set -u
-          RES="${GHA_RES:-}"
-          MOD="${GHA_TASK_DIR:-}/_gha/credinject.py"
-          if [ -z "$RES" ] || [ ! -d "$RES" ]; then
-            echo "没有 result 目录可脱敏（任务未启动），跳过"
-            exit 0
-          fi
-          if [ -z "${GHA_TASK_SECRETS:-}" ]; then
-            echo "无凭证 blob，无需脱敏"
-            exit 0
-          fi
-          if [ ! -f "$MOD" ]; then
-            echo "::warning::任务包里没有 _gha/credinject.py，跳过日志脱敏（artifact 扫描兜底）"
-            exit 0
-          fi
-          PYW=()
-          if command -v python3 >/dev/null 2>&1; then PYW=(python3)
-          elif command -v python >/dev/null 2>&1; then PYW=(python)
-          elif command -v py >/dev/null 2>&1; then PYW=(py -3)
-          fi
-          if [ ${#PYW[@]} -eq 0 ]; then
-            echo "::warning::runner 上没有 python，跳过日志脱敏（artifact 扫描兜底）"
-            exit 0
-          fi
-          # credinject --redact 只报"替换了几处 + 文件路径"，绝不回显值；
-          # 任何文件级失败也不阻断（本步骤恒退 0，剩下交给扫描兜底）
-          "${PYW[@]}" "$MOD" --redact \
-            "$RES/stdout.log" "$RES/stderr.log" "$RES/manifest.json"
-          exit 0
-
       # always()：任务失败 / 被强杀时状态同样值得留下（续跑正依赖它）。
       # continue-on-error：缓存保存失败（体积超限、服务抖动）不该拖垮整个 run。
       - name: Save state
@@ -601,132 +511,9 @@ jobs:
           } > "$GITHUB_STEP_SUMMARY"
           echo "job summary 已写入"
 
-      # ---- 凭证传递围栏（下游兜底）：artifact 上传前扫描【整个待上传载荷】——
-      #      result 目录下所有会进 artifact 的文件：output/ + stdout.log + stderr.log
-      #      + manifest.json。双通道并行：正则特征库兜"运行期才产生的、不在 blob 里
-      #      的敏感值"；已注册凭证值字面比对兜"任务把自己拿到的凭证写进产物"
-      #      （实测 fence-c 只有后者能拦住）。脱敏（Redact captured logs）在前，
-      #      日志类文件正常情况下已不含值、不会命中；output/ 是用户产物【不做静默改写】，
-      #      命中就拦下上传（fail-closed）。
-      #      命中只报 文件:行号，绝不回显值；命中即 ::error:: 并以非零结束本步骤，
-      #      下面的 Upload 靠 steps.outscan.outcome 跳过 —— 但 manifest / summary 等
-      #      always() 步骤不受影响（失败任务也要保留部分产物与现场，别破坏这语义）。
-      - name: Scan artifact payload
-        id: outscan
-        if: always()
-        shell: bash
-        run: |
-          set +e
-          set -u
-          RES="${GHA_RES:-}"
-          MOD="${GHA_TASK_DIR:-}/_gha/secrets.py"
-          if [ -z "$RES" ] || [ ! -d "$RES" ]; then
-            echo "没有 result 目录可扫描（任务未启动或目录不存在），跳过"
-            exit 0
-          fi
-          if [ ! -f "$MOD" ]; then
-            echo "::warning::任务包里没有 _gha/secrets.py，跳过 artifact 上传前扫描"
-            exit 0
-          fi
-          PYW=()
-          if command -v python3 >/dev/null 2>&1; then PYW=(python3)
-          elif command -v python >/dev/null 2>&1; then PYW=(python)
-          elif command -v py >/dev/null 2>&1; then PYW=(py -3)
-          fi
-          if [ ${#PYW[@]} -eq 0 ]; then
-            echo "::warning::runner 上没有 python，待上传载荷未经扫描照常上传"
-            exit 0
-          fi
-          # 扫描双通道，同一份待上传载荷跑两遍，命中同等处理（都只报 文件:行号，绝不回显值）：
-          #   1) 正则特征库 —— _gha/secrets.py（submit 前置扫描的同款规则），兜运行期新产生的敏感值
-          #   2) 已注册凭证值字面比对 —— _gha/credinject.py 的 find_literal_leaks（与 --redact
-          #      同一套替换集），兜"任务把自己拿到的凭证写进 output/ 产物"（实测 fence-c：
-          #      正则对不在特征库里的值零感知，明文凭证随 artifact 进了公开仓库）
-          # 两个模块都按文件路径加载，避免 import secrets 遮蔽标准库同名模块。
-          CJ="${GHA_TASK_DIR:-}/_gha/credinject.py"
-          if [ ! -f "$MOD" ] && [ ! -f "$CJ" ]; then
-            echo "::warning::任务包里没有 _gha/secrets.py 与 _gha/credinject.py，跳过 artifact 上传前扫描"
-            exit 0
-          fi
-          "${PYW[@]}" - "$MOD" "$CJ" "$RES" "$RES/manifest.json" <<'PY'
-          import importlib.util
-          import json
-          import os
-          import sys
-
-          # Windows runner 的 stdout 默认 cp1252，print 中文直接 UnicodeEncodeError ——
-          # 与模板内嵌 python 的既有约定一致，先重配。
-          try:
-              sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-          except Exception:
-              pass
-
-          mod_path, cj_path, payload_dir, manifest_path = (sys.argv[1], sys.argv[2],
-                                                           sys.argv[3], sys.argv[4])
-
-          def load(name, path):
-              # 旧包可能只缺一半：调用方已保证至少一个存在；缺的那个通道降级为 warning
-              if not os.path.isfile(path):
-                  return None
-              spec = importlib.util.spec_from_file_location(name, path)
-              m = importlib.util.module_from_spec(spec)
-              spec.loader.exec_module(m)
-              return m
-
-          content_hits, name_hits = [], []
-          sec_mod = load("gha_secrets_scan", mod_path)
-          if sec_mod is not None:
-              content_hits, name_hits = sec_mod.scan_secrets(payload_dir)
-
-          literal_hits = []
-          blob = os.environ.get("GHA_TASK_SECRETS", "")
-          if blob.strip():
-              cj_mod = load("gha_credinject_scan", cj_path)
-              if cj_mod is not None:
-                  literal_hits = cj_mod.find_literal_leaks(payload_dir, blob)
-              else:
-                  print("::warning::任务包里没有 _gha/credinject.py，"
-                        "已注册凭证值的字面比对通道未执行")
-
-          hits = content_hits + name_hits + literal_hits
-          if not hits:
-              print("artifact 上传前扫描通过：待上传载荷未命中凭据特征与已注册凭证值")
-              sys.exit(0)
-
-          for h in content_hits:
-              print("    内容命中: %s" % h)
-          for h in name_hits:
-              print("    文件命中: %s" % h)
-          for h in literal_hits:
-              print("    凭证值字面命中: %s" % h)
-          print("::error::待上传载荷凭据扫描命中 %d 处（正则特征 + 已注册凭证值字面比对，"
-                "只报文件:行号，值未回显） —— 已阻止 artifact 上传；任务输出请经凭证传递围栏"
-                "传递（见 SKILL.md）" % len(hits))
-
-          # 在 manifest 里记录阻止原因；manifest 可能还没生成（Build manifest 挂了），
-          # 尽力而为即可，写不进去也不影响"阻止上传"本身。
-          try:
-              with open(manifest_path, "r", encoding="utf-8") as f:
-                  mf = json.load(f)
-              mf["artifact_blocked"] = "secret_scan_hit"
-              with open(manifest_path, "w", encoding="utf-8") as f:
-                  json.dump(mf, f, ensure_ascii=False, indent=2)
-                  f.write("\n")
-          except Exception as e:
-              print("::warning::manifest.json 未能写入 artifact_blocked（%s）"
-                    % e.__class__.__name__)
-          sys.exit(1)
-          PY
-          rc=$?
-          if [ "$rc" -ne 0 ]; then
-            echo "artifact 上传将被跳过（扫描命中），run 结论如实为 failure"
-          fi
-          exit "$rc"
-
       # if: always() 是关键 —— 任务失败时更要上传，否则 agent 拿不到失败原因。
-      # steps.outscan.outcome：output/ 凭据扫描命中时【不上传】（兜底防线，见上一步）。
       - name: Upload result artifact
-        if: always() && steps.outscan.outcome != 'failure'
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: result-${{ inputs.task_id }}
