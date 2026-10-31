@@ -242,7 +242,6 @@ jobs:
             printf '{}' > "$CFG"
           fi
           chmod 600 "$CFG"
-          echo "GHA_RENDEZVOUS_ENDPOINT=$GHA_RENDEZVOUS_ENDPOINT" >> "$GITHUB_ENV"
           echo "GHA_INTERACTIVE_CONFIG_FILE=$CFG" >> "$GITHUB_ENV"
           echo "GHA_INTERACTIVE_ENABLED=true" >> "$GITHUB_ENV"
           echo "DISPLAY=:99" >> "$GITHUB_ENV"
