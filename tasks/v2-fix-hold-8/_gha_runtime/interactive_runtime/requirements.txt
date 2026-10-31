@@ -1,0 +1,4 @@
+aiohttp==3.12.15
+playwright==1.55.0
+cryptography==46.0.3
+PyYAML==6.0.3
