@@ -220,9 +220,10 @@ jobs:
             exit 1
           fi
           # 先做配置与平台预检，再安装大型依赖，避免无效部署。
-          export GHA_RENDEZVOUS_ENDPOINT="$($GHA_PYBIN -c 'import json,os; print(json.loads(os.environ.get("IN_INTERACTIVE_CONFIG") or "{}").get("rendezvous", {}).get("endpoint", ""))' 2>/dev/null || true)"
+          # Registry URL 也只允许从 Secret 注入，禁止经 Workflow Inputs 公开。
+          export GHA_RENDEZVOUS_ENDPOINT="$($GHA_PYBIN -c 'import json,os; cfg=json.loads(os.environ.get("IN_INTERACTIVE_CONFIG") or "{}"); blob=json.loads(os.environ.get("GHA_TASK_SECRETS") or "{}"); print(blob.get("GHA_RENDEZVOUS_ENDPOINT") or cfg.get("rendezvous", {}).get("endpoint", ""))' 2>/dev/null || true)"
           if [ -z "$GHA_RENDEZVOUS_ENDPOINT" ] && [ -z "${GHA_TUNNEL_HOSTNAME:-}" ]; then
-            echo "::error::未配置私有 Rendezvous：Quick Tunnel 必须在 --interactive-config 的 rendezvous.endpoint 中提供私有 Registry。"
+            echo "::error::未配置私有 Rendezvous：Quick Tunnel 必须在 GHA_TASK_SECRETS 中提供 GHA_RENDEZVOUS_ENDPOINT。"
             exit 1
           fi
           bash "$GHA_TASK_DIR/_gha_runtime/interactive_runtime/setup/install-linux.sh"
