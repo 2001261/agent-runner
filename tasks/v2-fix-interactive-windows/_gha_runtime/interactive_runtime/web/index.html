@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>gha-runner · 人工接管门户 (Human Handoff)</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --card-bg: #161b22;
+      --border: #30363d;
+      --primary: #238636;
+      --primary-hover: #2ea043;
+      --danger: #da3633;
+      --text: #c9d1d9;
+      --text-bright: #f0f6fc;
+      --accent: #58a6ff;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+    header {
+      background: var(--card-bg);
+      border-bottom: 1px solid var(--border);
+      padding: 10px 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .brand { font-size: 16px; font-weight: bold; color: var(--text-bright); display: flex; align-items: center; gap: 10px; }
+    .badge {
+      font-size: 12px;
+      padding: 3px 8px;
+      border-radius: 12px;
+      background: #1f6feb33;
+      color: var(--accent);
+      border: 1px solid #1f6feb66;
+    }
+    .controls { display: flex; gap: 10px; align-items: center; }
+    button {
+      padding: 7px 16px;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      border: 1px solid transparent;
+      transition: all 0.2s;
+    }
+    .btn-primary { background: var(--primary); color: #fff; }
+    .btn-primary:hover { background: var(--primary-hover); }
+    .btn-danger { background: var(--danger); color: #fff; }
+    .status-dot {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #238636;
+      margin-right: 6px;
+    }
+    #viewport-container {
+      flex: 1;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      background: #000;
+      position: relative;
+      overflow: auto;
+    }
+    #stream-canvas {
+      box-shadow: 0 0 20px rgba(0,0,0,0.8);
+      background: #111;
+      max-width: 100%;
+      max-height: 100%;
+      object-fit: contain;
+      cursor: crosshair;
+    }
+    #info-bar {
+      background: var(--card-bg);
+      border-top: 1px solid var(--border);
+      padding: 8px 20px;
+      font-size: 12px;
+      display: flex;
+      justify-content: space-between;
+    }
+    .dim { color: #8b949e; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span>gha-runner Interactive</span>
+      <span class="badge" id="mode-badge">Browser Handoff</span>
+    </div>
+    <div class="controls">
+      <span id="conn-status"><span class="status-dot"></span>已连接</span>
+      <button class="btn-primary" id="btn-complete">交还控制权给 Agent</button>
+    </div>
+  </header>
+
+  <div id="viewport-container">
+    <canvas id="stream-canvas" width="1280" height="800" tabindex="0"></canvas>
+  </div>
+
+  <div id="info-bar">
+    <span class="dim">提示：在此区域点击或键盘输入将实时同步到 Runner 浏览器。点击右上角交还控制权即可继续任务。</span>
+    <span id="gen-tag" class="dim">世代: gen-1</span>
+  </div>
+
+  <script src="/web/browser.js"></script>
+</body>
+</html>
