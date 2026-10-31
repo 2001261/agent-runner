@@ -210,16 +210,38 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          echo "=== 启动 Interactive Runtime 交互图形环境 ==="
-          if [ "${RUNNER_OS:-}" = "Linux" ]; then
-            sudo apt-get update -y && sudo apt-get install -y xvfb openbox dbus-x11 || true
-            export DISPLAY=":99"
-            Xvfb :99 -screen 0 1280x800x24 -ac +extension RANDR >/dev/null 2>&1 &
-            sleep 1
-            if command -v openbox >/dev/null 2>&1; then openbox >/dev/null 2>&1 & fi
-            echo "DISPLAY=:99" >> "$GITHUB_ENV"
+          echo "=== 安装并预检 Interactive Runtime（禁止模拟成功） ==="
+          if [ "${RUNNER_OS:-}" != "Linux" ]; then
+            echo "::error::Interactive Runtime 首发只支持 ubuntu-24.04 / ubuntu-latest；当前 ${RUNNER_OS}。"
+            exit 1
           fi
+          if [ ! -f "$GHA_TASK_DIR/_gha_runtime/interactive_runtime/main.py" ]; then
+            echo "::error::任务包缺少 _gha_runtime；请使用支持 Interactive Runtime 的 gha 版本重新提交。"
+            exit 1
+          fi
+          # 先做配置与平台预检，再安装大型依赖，避免无效部署。
+          export GHA_RENDEZVOUS_ENDPOINT="$($GHA_PYBIN -c 'import json,os; print(json.loads(os.environ.get("IN_INTERACTIVE_CONFIG") or "{}").get("rendezvous", {}).get("endpoint", ""))' 2>/dev/null || true)"
+          if [ -z "$GHA_RENDEZVOUS_ENDPOINT" ] && [ -z "${GHA_TUNNEL_HOSTNAME:-}" ]; then
+            echo "::error::未配置私有 Rendezvous：Quick Tunnel 必须在 --interactive-config 的 rendezvous.endpoint 中提供私有 Registry。"
+            exit 1
+          fi
+          bash "$GHA_TASK_DIR/_gha_runtime/interactive_runtime/setup/install-linux.sh"
+
+          PRIVATE_DIR="$RUNNER_TEMP/gha-interactive-private"
+          mkdir -p "$PRIVATE_DIR"
+          chmod 700 "$PRIVATE_DIR"
+          CFG="$PRIVATE_DIR/interactive.json"
+          if [ -n "$IN_INTERACTIVE_CONFIG" ]; then
+            printf '%s' "$IN_INTERACTIVE_CONFIG" > "$CFG"
+          else
+            printf '{}' > "$CFG"
+          fi
+          chmod 600 "$CFG"
+          echo "GHA_RENDEZVOUS_ENDPOINT=$GHA_RENDEZVOUS_ENDPOINT" >> "$GITHUB_ENV"
+          echo "GHA_INTERACTIVE_CONFIG_FILE=$CFG" >> "$GITHUB_ENV"
           echo "GHA_INTERACTIVE_ENABLED=true" >> "$GITHUB_ENV"
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+          bash "$GHA_TASK_DIR/_gha_runtime/interactive_runtime/setup/verify.sh"
 
       - name: Run task
         id: task
@@ -288,7 +310,23 @@ jobs:
           export PYTHONIOENCODING=utf-8
           (
             cd "$GHA_TASK_DIR" || exit 127
-            if [ ${#WRAP[@]} -gt 0 ] && [ -f "$GHA_TASK_DIR/_gha/credinject.py" ]; then
+            if [ "${GHA_INTERACTIVE_ENABLED:-}" = "true" ]; then
+              # Runtime Supervisor 统一管理图形环境、Gateway、Tunnel 与任务生命周期；
+              # Registry 凭证由 credinject 注入到 Runtime 及其子任务，绝不写入配置或日志。
+              if [ -n "$interp" ]; then
+                printf -v TASK_CMD '%q ' "$interp" "./$GHA_ENTRY"
+              else
+                printf -v TASK_CMD '%q ' bash "./$GHA_ENTRY"
+              fi
+              export PYTHONPATH="$GHA_TASK_DIR/_gha_runtime"
+              RUNTIME_CMD=("$GHA_INTERACTIVE_VENV/bin/python" -m interactive_runtime.main
+                --config "$GHA_INTERACTIVE_CONFIG_FILE" --command "$TASK_CMD")
+              if [ ${#WRAP[@]} -gt 0 ] && [ -f "$GHA_TASK_DIR/_gha/credinject.py" ]; then
+                "${WRAP[@]}" "$GHA_TASK_DIR/_gha/credinject.py" -- "${RUNTIME_CMD[@]}"
+              else
+                "${RUNTIME_CMD[@]}"
+              fi
+            elif [ ${#WRAP[@]} -gt 0 ] && [ -f "$GHA_TASK_DIR/_gha/credinject.py" ]; then
               if [ -n "$interp" ]; then
                 "${WRAP[@]}" "$GHA_TASK_DIR/_gha/credinject.py" -- "$interp" "./$GHA_ENTRY"
               else
