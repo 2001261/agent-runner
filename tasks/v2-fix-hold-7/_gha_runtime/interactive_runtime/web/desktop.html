@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>gha-runner · Desktop Handoff</title>
+  <style>
+    body { margin:0; background:#0d1117; color:#c9d1d9; font-family:system-ui,sans-serif; }
+    header { height:48px; display:flex; align-items:center; justify-content:space-between; padding:0 16px; background:#161b22; }
+    button { background:#238636; color:white; border:0; border-radius:6px; padding:8px 14px; cursor:pointer; }
+    #screen { width:100vw; height:calc(100vh - 48px); background:#000; }
+  </style>
+</head>
+<body>
+<header>
+  <strong>Desktop Handoff · <span id="status">正在认领…</span></strong>
+  <button id="complete">交还控制权给 Agent</button>
+</header>
+<div id="screen"></div>
+<script type="module">
+  import RFB from "/web/novnc/core/rfb.js";
+  const status = document.getElementById("status");
+  const ticket = new URLSearchParams(location.hash.replace(/^#/, "")).get("ticket");
+  let rfb = null;
+  if (ticket) {
+    const resp = await fetch("/v1/handoff/claim", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ticket}),
+    });
+    if (!resp.ok) {
+      status.textContent = "接管票据无效或已过期";
+      throw new Error("handoff claim failed");
+    }
+  }
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  rfb = new RFB(document.getElementById("screen"), `${scheme}://${location.host}/v1/live/desktop`);
+  rfb.addEventListener("connect", () => { status.textContent = "人工控制中（同一桌面）"; });
+  rfb.addEventListener("disconnect", () => { status.textContent = "连接已断开"; });
+  document.getElementById("complete").addEventListener("click", async () => {
+    const resp = await fetch("/v1/handoff/complete", {method: "POST"});
+    if (resp.ok) {
+      status.textContent = "已交还 Agent";
+      if (rfb) rfb.disconnect();
+    }
+  });
+</script>
+</body>
+</html>
