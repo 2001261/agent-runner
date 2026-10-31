@@ -221,7 +221,8 @@ jobs:
           fi
           # 先做配置与平台预检，再安装大型依赖，避免无效部署。
           # Registry URL 也只允许从 Secret 注入，禁止经 Workflow Inputs 公开。
-          export GHA_RENDEZVOUS_ENDPOINT="$($GHA_PYBIN -c 'import json,os; cfg=json.loads(os.environ.get("IN_INTERACTIVE_CONFIG") or "{}"); blob=json.loads(os.environ.get("GHA_TASK_SECRETS") or "{}"); print(blob.get("GHA_RENDEZVOUS_ENDPOINT") or cfg.get("rendezvous", {}).get("endpoint", ""))' 2>/dev/null || true)"
+          PYCFG="${GHA_PYBIN:-python3}"
+          export GHA_RENDEZVOUS_ENDPOINT="$($PYCFG -c 'import json,os; cfg=json.loads(os.environ.get("IN_INTERACTIVE_CONFIG") or "{}"); blob=json.loads(os.environ.get("GHA_TASK_SECRETS") or "{}"); print(blob.get("GHA_RENDEZVOUS_ENDPOINT") or cfg.get("rendezvous", {}).get("endpoint", ""))' 2>/dev/null || true)"
           if [ -z "$GHA_RENDEZVOUS_ENDPOINT" ] && [ -z "${GHA_TUNNEL_HOSTNAME:-}" ]; then
             echo "::error::未配置私有 Rendezvous：Quick Tunnel 必须在 GHA_TASK_SECRETS 中提供 GHA_RENDEZVOUS_ENDPOINT。"
             exit 1
@@ -271,6 +272,20 @@ jobs:
             node)    interp="node" ;;
           esac
 
+          # Windows 上裸 `bash` 可能解析到 WSL（没有发行版时直接失败）。
+          # 嵌套启动任务必须显式使用 Git for Windows 自带 Bash，并在运行前检查。
+          BASH_BIN="bash"
+          if [ "${RUNNER_OS:-}" = "Windows" ]; then
+            BASH_BIN=""
+            for candidate in "/c/Program Files/Git/bin/bash.exe" "/c/Program Files/Git/usr/bin/bash.exe"; do
+              if [ -x "$candidate" ]; then BASH_BIN="$candidate"; break; fi
+            done
+            if [ -z "$BASH_BIN" ]; then
+              echo "::error::Windows 环境预检失败：未找到 Git for Windows Bash，拒绝用 WSL 代替。"
+              exit 1
+            fi
+          fi
+
           # ---- 凭证传递围栏：有 _gha/credinject.py 就经它包装启动（bundle 与分支投递
           #      都会带上这份支持文件）。它负责：按 declared.json 白名单把仓库 secret
           #      JSON export 成原生 env 名、原样传播退出码。解释器发现沿用现状：
@@ -317,7 +332,7 @@ jobs:
               if [ -n "$interp" ]; then
                 printf -v TASK_CMD '%q ' "$interp" "./$GHA_ENTRY"
               else
-                printf -v TASK_CMD '%q ' bash "./$GHA_ENTRY"
+                printf -v TASK_CMD '%q ' "$BASH_BIN" "./$GHA_ENTRY"
               fi
               export PYTHONPATH="$GHA_TASK_DIR/_gha_runtime"
               RUNTIME_CMD=("$GHA_INTERACTIVE_VENV/bin/python" -m interactive_runtime.main
@@ -331,12 +346,12 @@ jobs:
               if [ -n "$interp" ]; then
                 "${WRAP[@]}" "$GHA_TASK_DIR/_gha/credinject.py" -- "$interp" "./$GHA_ENTRY"
               else
-                "${WRAP[@]}" "$GHA_TASK_DIR/_gha/credinject.py" -- bash "./$GHA_ENTRY"
+                "${WRAP[@]}" "$GHA_TASK_DIR/_gha/credinject.py" -- "$BASH_BIN" "./$GHA_ENTRY"
               fi
             elif [ -n "$interp" ]; then
               "$interp" "./$GHA_ENTRY"
             else
-              bash "./$GHA_ENTRY"
+              "$BASH_BIN" "./$GHA_ENTRY"
             fi
           ) >> "$RES/stdout.log" 2>> "$RES/stderr.log"
           code=$?
