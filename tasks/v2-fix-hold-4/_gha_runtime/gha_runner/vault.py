@@ -1,0 +1,503 @@
+"""Agent Host 本地存储与凭据加密库（Vault）。
+
+遵循《2.0 迭代.md》第十章、第十一章、第十二章、第十三章与第十七章规范。
+宿主机是持久化中心，承担认证状态（Cookie/Storage）、Profile 归档、凭据及运行产物的长期加密存储。
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import json
+import os
+import shutil
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    HAS_CRYPTOGRAPHY = True
+except ImportError:
+    HAS_CRYPTOGRAPHY = False
+
+
+DEFAULT_VAULT_ROOT = os.path.expanduser("~/.gha-runner")
+
+
+@dataclass
+class VaultObjectMetadata:
+    id: str
+    category: str  # "auth_state" | "profile" | "credential" | "recording" | "checkpoint"
+    project: str
+    name: str
+    version: int
+    created_at: float
+    size: int
+    sha256: str
+    encrypted: bool
+    encryption_algo: str = "AES-256-GCM"
+    compatibility: Dict[str, Any] = field(default_factory=dict)
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+
+class VaultError(Exception):
+    """Vault 操作异常"""
+    pass
+
+
+class Vault:
+    """Agent Host 本地加密存储中心"""
+
+    def __init__(self, root_dir: Optional[str] = None):
+        self.root = Path(root_dir or os.environ.get("GHA_VAULT_ROOT", DEFAULT_VAULT_ROOT))
+        self.config_dir = self.root / "config"
+        self.vault_dir = self.root / "vault"
+        self.auth_dir = self.vault_dir / "auth"
+        self.profiles_dir = self.vault_dir / "profiles"
+        self.creds_dir = self.vault_dir / "credentials"
+        self.objects_dir = self.vault_dir / "objects"
+        self.keys_dir = self.vault_dir / "keys"
+        self.sessions_dir = self.root / "sessions"
+        self.transfers_dir = self.root / "transfers"
+        self.state_dir = self.root / "state"
+        self.index_file = self.state_dir / "index.json"
+
+        self._key: Optional[bytes] = None
+        self._ensure_structure()
+
+    def _ensure_structure(self) -> None:
+        """初始化目录结构并限制权限"""
+        for d in [
+            self.config_dir,
+            self.vault_dir,
+            self.auth_dir,
+            self.profiles_dir,
+            self.creds_dir,
+            self.objects_dir,
+            self.keys_dir,
+            self.sessions_dir,
+            self.transfers_dir / "incoming",
+            self.transfers_dir / "outgoing",
+            self.transfers_dir / "partial",
+            self.state_dir,
+        ]:
+            d.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(str(d), 0o700)
+            except OSError:
+                pass
+
+        if not self.index_file.exists():
+            self._save_index({"schema": "gha-vault/v1", "updated_at": time.time(), "objects": {}})
+
+    def get_master_key(self) -> bytes:
+        """获取或生成本地 Vault 主密钥 (AES-256, 32 bytes)"""
+        if self._key is not None:
+            return self._key
+
+        key_file = self.keys_dir / "master.key"
+        if key_file.exists():
+            with open(key_file, "rb") as f:
+                key = f.read()
+            if len(key) == 32:
+                self._key = key
+                return key
+
+        # 生成新密钥
+        new_key = os.urandom(32)
+        with open(key_file, "wb") as f:
+            f.write(new_key)
+        try:
+            os.chmod(str(key_file), 0o600)
+        except OSError:
+            pass
+        self._key = new_key
+        return new_key
+
+    def encrypt_data(self, plaintext: bytes) -> bytes:
+        """只使用经过验证的 AES-256-GCM；缺依赖时拒绝写入，绝不自研降级算法。"""
+        if not HAS_CRYPTOGRAPHY:
+            raise VaultError("缺少 cryptography，无法使用 AES-256-GCM；请安装后重试")
+        key = self.get_master_key()
+        aesgcm = AESGCM(key)
+        nonce = os.urandom(12)
+        ciphertext = aesgcm.encrypt(nonce, plaintext, None)
+        return nonce + ciphertext
+
+    def decrypt_data(self, payload: bytes) -> bytes:
+        """解密 Vault 数据"""
+        key = self.get_master_key()
+        if payload.startswith(b"FALLBACK1:"):
+            # 兼容解密
+            body = payload[len(b"FALLBACK1:"):]
+            nonce, tag, ct = body[:16], body[16:32], body[32:]
+            mac_key = hashlib.sha256(key + b":mac").digest()
+            expected_tag = hashlib.sha256(mac_key + nonce + ct).digest()[:16]
+            if not hmac.compare_digest(tag, expected_tag):
+                raise VaultError("Vault 解密校验失败（MAC 不匹配）")
+            ctr_key = hashlib.sha256(key + b":ctr").digest()
+            keystream = bytearray()
+            block_idx = 0
+            while len(keystream) < len(ct):
+                h = hashlib.sha256(ctr_key + nonce + block_idx.to_bytes(8, "big")).digest()
+                keystream.extend(h)
+                block_idx += 1
+            return bytes(c ^ k for c, k in zip(ct, keystream[:len(ct)]))
+
+        if HAS_CRYPTOGRAPHY:
+            aesgcm = AESGCM(key)
+            nonce = payload[:12]
+            ciphertext = payload[12:]
+            try:
+                return aesgcm.decrypt(nonce, ciphertext, None)
+            except Exception as e:
+                raise VaultError(f"Vault AES-GCM 解密失败: {e}") from e
+
+        raise VaultError("缺少解密依赖且密文不是兼容格式")
+
+    def _load_index(self) -> Dict[str, Any]:
+        try:
+            with open(self.index_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {"schema": "gha-vault/v1", "updated_at": time.time(), "objects": {}}
+
+    def _save_index(self, data: Dict[str, Any]) -> None:
+        data["updated_at"] = time.time()
+        tmp = self.state_dir / "index.json.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        tmp.replace(self.index_file)
+
+    # ---- Auth State 管理 (Cookies / LocalStorage)
+    def store_auth_state(
+        self,
+        project: str,
+        name: str,
+        state_dict: Dict[str, Any],
+        compatibility: Optional[Dict[str, Any]] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> VaultObjectMetadata:
+        """存储浏览器认证状态（Playwright storage_state 格式）"""
+        target_dir = self.auth_dir / project / name
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        raw = json.dumps(state_dict, ensure_ascii=False).encode("utf-8")
+        digest = hashlib.sha256(raw).hexdigest()
+
+        index = self._load_index()
+        # 寻找已有版本
+        obj_id = f"auth-{project}-{name}"
+        prev_meta = index.get("objects", {}).get(obj_id)
+        version = (prev_meta["version"] + 1) if prev_meta else 1
+
+        enc = self.encrypt_data(raw)
+        data_file = target_dir / f"state-v{version:03d}.enc"
+        with open(data_file, "wb") as f:
+            f.write(enc)
+
+        meta = VaultObjectMetadata(
+            id=obj_id,
+            category="auth_state",
+            project=project,
+            name=name,
+            version=version,
+            created_at=time.time(),
+            size=len(raw),
+            sha256=digest,
+            encrypted=True,
+            encryption_algo="AES-256-GCM" if HAS_CRYPTOGRAPHY else "CTR-HMAC",
+            compatibility=compatibility or {},
+            extra=extra or {},
+        )
+
+        meta_file = target_dir / "metadata.json"
+        with open(meta_file, "w", encoding="utf-8") as f:
+            json.dump(asdict(meta), f, ensure_ascii=False, indent=2)
+
+        index["objects"][obj_id] = asdict(meta)
+        index["objects"][obj_id]["file"] = str(data_file.relative_to(self.root))
+        self._save_index(index)
+        return meta
+
+    def get_auth_state(self, project: str, name: str) -> Tuple[Optional[Dict[str, Any]], Optional[VaultObjectMetadata]]:
+        """获取并解密最新的认证状态"""
+        obj_id = f"auth-{project}-{name}"
+        index = self._load_index()
+        meta_dict = index.get("objects", {}).get(obj_id)
+        if not meta_dict:
+            return None, None
+
+        rel_path = meta_dict.get("file")
+        if not rel_path:
+            return None, None
+
+        full_path = self.root / rel_path
+        if not full_path.exists():
+            return None, None
+
+        with open(full_path, "rb") as f:
+            enc = f.read()
+
+        raw = self.decrypt_data(enc)
+        state_dict = json.loads(raw.decode("utf-8"))
+        meta = VaultObjectMetadata(**{k: v for k, v in meta_dict.items() if k != "file"})
+        return state_dict, meta
+
+    # ---- Profile 备份与归档
+    def store_profile_archive(
+        self,
+        project: str,
+        name: str,
+        archive_path: str,
+        compatibility: Optional[Dict[str, Any]] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> VaultObjectMetadata:
+        """存储 Chromium 完整用户数据目录归档"""
+        if not os.path.isfile(archive_path):
+            raise VaultError(f"归档文件不存在: {archive_path}")
+
+        target_dir = self.profiles_dir / project / name
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        with open(archive_path, "rb") as f:
+            raw = f.read()
+
+        digest = hashlib.sha256(raw).hexdigest()
+        obj_id = f"profile-{project}-{name}"
+        index = self._load_index()
+        prev_meta = index.get("objects", {}).get(obj_id)
+        version = (prev_meta["version"] + 1) if prev_meta else 1
+
+        enc = self.encrypt_data(raw)
+        data_file = target_dir / f"profile-v{version:03d}.enc"
+        with open(data_file, "wb") as f:
+            f.write(enc)
+
+        meta = VaultObjectMetadata(
+            id=obj_id,
+            category="profile",
+            project=project,
+            name=name,
+            version=version,
+            created_at=time.time(),
+            size=len(raw),
+            sha256=digest,
+            encrypted=True,
+            encryption_algo="AES-256-GCM" if HAS_CRYPTOGRAPHY else "CTR-HMAC",
+            compatibility=compatibility or {},
+            extra=extra or {},
+        )
+
+        meta_file = target_dir / "metadata.json"
+        with open(meta_file, "w", encoding="utf-8") as f:
+            json.dump(asdict(meta), f, ensure_ascii=False, indent=2)
+
+        index["objects"][obj_id] = asdict(meta)
+        index["objects"][obj_id]["file"] = str(data_file.relative_to(self.root))
+        self._save_index(index)
+        return meta
+
+    def extract_profile_archive(self, project: str, name: str, output_path: str) -> Optional[VaultObjectMetadata]:
+        """解密 Profile 归档至目标文件路径"""
+        obj_id = f"profile-{project}-{name}"
+        index = self._load_index()
+        meta_dict = index.get("objects", {}).get(obj_id)
+        if not meta_dict:
+            return None
+
+        rel_path = meta_dict.get("file")
+        if not rel_path:
+            return None
+
+        full_path = self.root / rel_path
+        if not full_path.exists():
+            return None
+
+        with open(full_path, "rb") as f:
+            enc = f.read()
+
+        raw = self.decrypt_data(enc)
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        with open(output_path, "wb") as f:
+            f.write(raw)
+
+        return VaultObjectMetadata(**{k: v for k, v in meta_dict.items() if k != "file"})
+
+    # ---- 凭据管理 (Agent Credential Vault)
+    def store_credential(
+        self,
+        project: str,
+        key: str,
+        value: str,
+        description: str = "",
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> VaultObjectMetadata:
+        """存储由用户明确授权的登录账号密码等凭据"""
+        target_dir = self.creds_dir / project
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        raw = value.encode("utf-8")
+        digest = hashlib.sha256(raw).hexdigest()
+        obj_id = f"cred-{project}-{key}"
+
+        enc = self.encrypt_data(raw)
+        data_file = target_dir / f"{key}.enc"
+        with open(data_file, "wb") as f:
+            f.write(enc)
+
+        meta = VaultObjectMetadata(
+            id=obj_id,
+            category="credential",
+            project=project,
+            name=key,
+            version=1,
+            created_at=time.time(),
+            size=len(raw),
+            sha256=digest,
+            encrypted=True,
+            encryption_algo="AES-256-GCM" if HAS_CRYPTOGRAPHY else "CTR-HMAC",
+            compatibility={},
+            extra={"description": description, **(extra or {})},
+        )
+
+        index = self._load_index()
+        index["objects"][obj_id] = asdict(meta)
+        index["objects"][obj_id]["file"] = str(data_file.relative_to(self.root))
+        self._save_index(index)
+        return meta
+
+    def get_credential(self, project: str, key: str) -> Optional[str]:
+        """获取解密后的凭据值"""
+        obj_id = f"cred-{project}-{key}"
+        index = self._load_index()
+        meta_dict = index.get("objects", {}).get(obj_id)
+        if not meta_dict:
+            return None
+
+        rel_path = meta_dict.get("file")
+        if not rel_path:
+            return None
+
+        full_path = self.root / rel_path
+        if not full_path.exists():
+            return None
+
+        with open(full_path, "rb") as f:
+            enc = f.read()
+
+        return self.decrypt_data(enc).decode("utf-8")
+
+    @staticmethod
+    def _path_component(value: str) -> str:
+        cleaned = "".join(c if c.isalnum() or c in "._-" else "_" for c in str(value))
+        return cleaned[:96] or "unnamed"
+
+    def store_binary_object(
+        self,
+        project: str,
+        name: str,
+        data: bytes,
+        category: str,
+        compatibility: Optional[Dict[str, Any]] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> VaultObjectMetadata:
+        """加密保存录像、截图、Trace 等任意二进制对象，不做 UTF-8 转码。"""
+        target_dir = self.objects_dir / self._path_component(project) / self._path_component(name)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        obj_id = f"object-{project}-{name}"
+        index = self._load_index()
+        previous = index.get("objects", {}).get(obj_id)
+        version = previous["version"] + 1 if previous else 1
+        digest = hashlib.sha256(data).hexdigest()
+        data_file = target_dir / f"object-v{version:03d}.enc"
+        with open(data_file, "wb") as f:
+            f.write(self.encrypt_data(data))
+        meta = VaultObjectMetadata(
+            id=obj_id,
+            category=category,
+            project=project,
+            name=name,
+            version=version,
+            created_at=time.time(),
+            size=len(data),
+            sha256=digest,
+            encrypted=True,
+            encryption_algo="AES-256-GCM" if HAS_CRYPTOGRAPHY else "CTR-HMAC",
+            compatibility=compatibility or {},
+            extra=extra or {},
+        )
+        index["objects"][obj_id] = asdict(meta)
+        index["objects"][obj_id]["file"] = str(data_file.relative_to(self.root))
+        self._save_index(index)
+        return meta
+
+    def get_binary_object(self, project: str, name: str) -> Tuple[Optional[bytes], Optional[VaultObjectMetadata]]:
+        obj_id = f"object-{project}-{name}"
+        meta_dict = self._load_index().get("objects", {}).get(obj_id)
+        if not meta_dict or not meta_dict.get("file"):
+            return None, None
+        full_path = self.root / meta_dict["file"]
+        if not full_path.exists():
+            return None, None
+        with open(full_path, "rb") as f:
+            data = self.decrypt_data(f.read())
+        meta = VaultObjectMetadata(**{k: v for k, v in meta_dict.items() if k != "file"})
+        return data, meta
+
+    # ---- 通用查询、检查与清理
+    def list_objects(
+        self,
+        category: Optional[str] = None,
+        project: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """列出 Vault 中的对象元数据（绝不暴露密码与状态原文）"""
+        index = self._load_index()
+        results = []
+        for obj_id, data in index.get("objects", {}).items():
+            if category and data.get("category") != category:
+                continue
+            if project and data.get("project") != project:
+                continue
+            # 安全展示：拷贝并剥离本地敏感路径
+            item = dict(data)
+            results.append(item)
+        return sorted(results, key=lambda x: x.get("created_at", 0), reverse=True)
+
+    def inspect_object(self, object_id: str) -> Optional[Dict[str, Any]]:
+        """查看指定对象的元数据与完整性信息"""
+        index = self._load_index()
+        item = index.get("objects", {}).get(object_id)
+        if not item:
+            return None
+        res = dict(item)
+        # 验证物理文件是否存在
+        rel_path = item.get("file")
+        if rel_path:
+            full_path = self.root / rel_path
+            res["file_exists"] = full_path.exists()
+            if full_path.exists():
+                res["stored_bytes"] = full_path.stat().st_size
+        return res
+
+    def delete_object(self, object_id: str) -> bool:
+        """安全删除指定 Vault 对象及其物理文件"""
+        index = self._load_index()
+        item = index.get("objects", {}).pop(object_id, None)
+        if not item:
+            return False
+
+        rel_path = item.get("file")
+        if rel_path:
+            full_path = self.root / rel_path
+            if full_path.exists():
+                try:
+                    full_path.unlink()
+                except OSError:
+                    pass
+        self._save_index(index)
+        return True
