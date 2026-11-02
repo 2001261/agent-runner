@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>gha-runner · Desktop Handoff</title>
+  <!--
+    独立的 Desktop Handoff 页（index.html 是同时支持 browser/desktop 的门户）。
+    - noVNC 用绝对路径 /web/novnc/ 加载：页面在 / 或 /?mode=desktop 下都解析到同一资源，
+      与 Gateway 注册的 /web/novnc/ 静态路由一致。
+    - Ticket 只从 location.hash 读取；认领成功后立即从地址栏抹掉，避免被复制/截图泄露。
+    - 连接的是 Gateway 的 /v1/live/desktop，由 Gateway 校验 HUMAN_DESKTOP scope 与 Origin
+      后转发给本机 websockify；页面本身从不直连 6080。
+  -->
+  <style>
+    :root { --border:#30363d; --text:#c9d1d9; --accent:#58a6ff; --ok:#238636; --bad:#da3633; }
+    * { box-sizing:border-box; margin:0; padding:0; }
+    body { height:100vh; display:flex; flex-direction:column; background:#0d1117; color:var(--text);
+           font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; overflow:hidden; }
+    header { height:52px; display:flex; align-items:center; justify-content:space-between;
+             padding:0 16px; background:#161b22; border-bottom:1px solid var(--border); }
+    .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#8b949e; margin-right:6px; }
+    .dot.ok { background:var(--ok); }
+    .dot.bad { background:var(--bad); }
+    .dim { color:#8b949e; font-size:12px; }
+    button { background:var(--ok); color:#fff; border:0; border-radius:6px; padding:8px 14px;
+             font-weight:600; cursor:pointer; }
+    button:disabled { background:#484f58; cursor:default; }
+    #screen { flex:1; background:#000; position:relative; outline:none; }
+    #screen > div { width:100%; height:100%; }
+    footer { padding:6px 16px; background:#161b22; border-top:1px solid var(--border); font-size:12px; }
+  </style>
+</head>
+<body>
+<header>
+  <strong>Desktop Handoff · <span id="status">正在认领…</span></strong>
+  <div>
+    <span id="conn" class="dim"><span class="dot" id="conn-dot"></span>未连接</span>
+    <button id="complete" disabled>交还控制权给 Agent</button>
+  </div>
+</header>
+<div id="screen" tabindex="0" aria-label="远程桌面画面"></div>
+<footer class="dim">画面经 Xvfb → x11vnc → websockify → Gateway → 本页面传输；交还后 x11vnc 关闭，桌面与 Chromium 继续运行，Agent 可立即继续操作。</footer>
+
+<script type="module">
+  const statusEl = document.getElementById("status");
+  const connEl = document.getElementById("conn");
+  const connDot = document.getElementById("conn-dot");
+  const completeBtn = document.getElementById("complete");
+  const screenEl = document.getElementById("screen");
+
+  // 1. Ticket 只从 fragment 取；fragment 不会随 HTTP 请求发给 Gateway 或 Tunnel 日志。
+  const params = new URLSearchParams(location.hash.replace(/^#/, ""));
+  const ticket = params.get("ticket");
+
+  function setStatus(text) { statusEl.textContent = text; }
+  function setConn(text, state) {
+    connEl.innerHTML = `<span class="dot ${state || ""}"></span>${text}`;
+  }
+
+  // 2. 认领：换取 HUMAN_DESKTOP session Cookie 与当前世代。
+  //    没有 ticket（例如认领后刷新页面）时用已有 Cookie 查会话，不会 400。
+  let generation = null;
+  try {
+    const resp = ticket
+      ? await fetch("/v1/handoff/claim", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ticket }),
+        })
+      : await fetch("/v1/session", { credentials: "same-origin" });
+    if (!resp.ok) {
+      setStatus(resp.status === 403 ? "接管票据无效或已过期" : `认领失败（HTTP ${resp.status}）`);
+      setConn("未连接", "bad");
+      throw new Error(`handoff claim failed: ${resp.status}`);
+    }
+    const data = await resp.json();
+    generation = data.generation;
+    if (data.mode && data.mode !== "desktop") {
+      // 票据是浏览器模式，且认领已经成功（Cookie 已是 HUMAN_BROWSER）：
+      // 换到浏览器门户即可，不能再把已消费的 ticket 放进 fragment。
+      location.replace("/?mode=browser");
+      throw new Error(`ticket mode is ${data.mode}`);
+    }
+    setStatus("已认领，正在连接桌面…");
+    if (history.replaceState) history.replaceState(null, "", location.pathname + location.search);
+  } catch (err) {
+    if (!statusEl.textContent || statusEl.textContent === "正在认领…") setStatus("认领失败");
+    throw err;
+  }
+
+  // 3. 加载 noVNC core/rfb.js，连接 Gateway 的桌面 WebSocket（不直连 websockify）。
+  //    页面在 / 或 /?mode=desktop 下，noVNC 挂在 /web/novnc/，必须用绝对路径导入。
+  let RFB;
+  try {
+    RFB = (await import("/web/novnc/core/rfb.js")).default;
+  } catch (err) {
+    setStatus("noVNC 资源缺失：/web/novnc/core/rfb.js 不可用");
+    setConn("未连接", "bad");
+    throw err;
+  }
+
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  const rfb = new RFB(screenEl, `${scheme}://${location.host}/v1/live/desktop`, {
+    shared: true,
+    credentials: {},
+  });
+  rfb.scaleViewport = true;
+  rfb.resizeSession = false;
+  rfb.focusOnClick = true;
+
+  rfb.addEventListener("connect", () => {
+    setStatus("人工控制中（同一桌面，Chromium 未重启）");
+    setConn("已连接", "ok");
+    completeBtn.disabled = false;
+    screenEl.focus();
+  });
+  rfb.addEventListener("disconnect", (ev) => {
+    setConn("连接已断开", "bad");
+    completeBtn.disabled = true;
+    if (!(ev.detail && ev.detail.clean)) setStatus("连接意外中断，请刷新页面重新认领");
+  });
+  rfb.addEventListener("securityfailure", (ev) => {
+    setConn("VNC 认证失败", "bad");
+    setStatus(`VNC 认证失败：${ev.detail && ev.detail.reason ? ev.detail.reason : "未知原因"}`);
+  });
+
+  // 4. 交还：停止流并恢复 Agent 控制；页面不断开桌面，便于观察 Agent 继续操作。
+  completeBtn.addEventListener("click", async () => {
+    completeBtn.disabled = true;
+    completeBtn.textContent = "正在交还…";
+    try {
+      const resp = await fetch("/v1/handoff/complete", {
+        method: "POST",
+        credentials: "same-origin",
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      rfb.disconnect();
+      setStatus("已交还 Agent，x11vnc 已关闭，桌面仍在运行");
+      setConn("已交还", "");
+      completeBtn.textContent = "已交还控制权";
+    } catch (err) {
+      setStatus(`交还失败：${err.message}`);
+      completeBtn.disabled = false;
+      completeBtn.textContent = "交还控制权给 Agent";
+    }
+  });
+</script>
+</body>
+</html>
