@@ -225,6 +225,14 @@ jobs:
           export GHA_RENDEZVOUS_ENDPOINT="$($PYCFG -c 'import json,os; cfg=json.loads(os.environ.get("IN_INTERACTIVE_CONFIG") or "{}"); blob=json.loads(os.environ.get("GHA_TASK_SECRETS") or "{}"); print(blob.get("GHA_RENDEZVOUS_ENDPOINT") or cfg.get("rendezvous", {}).get("endpoint", ""))' 2>/dev/null || true)"
           if [ -f "$GHA_TASK_DIR/_gha/credinject.py" ]; then
             "$PYCFG" "$GHA_TASK_DIR/_gha/credinject.py" --mask-only
+            # 预检（verify.sh）直接读 env 判断凭证是否“已注入”，而注入发生在 Run task
+            # 步骤里。这里先用同一个白名单注入一次，让预检看到真实环境；Run task 步骤
+            # 仍会自己再注入（子 shell 里的 export 不会跨步骤留存）。
+            # 显式 turn_off_echo 关掉 xtrace：bash -x 调试时也不会把值打进步骤日志。
+            CREDINJECT="$GHA_TASK_DIR/_gha/credinject.py"
+            turn_off_echo() { case $- in *x*) set +x; return 0;; esac; return 1; }
+            eval "$("$PYCFG" "$CREDINJECT" --emit-export)"
+            if turn_off_echo; then set -x; fi
           fi
           if [ -z "$GHA_RENDEZVOUS_ENDPOINT" ] && [ -z "${GHA_TUNNEL_HOSTNAME:-}" ]; then
             echo "::error::未配置私有 Rendezvous：Quick Tunnel 必须在 GHA_TASK_SECRETS 中提供 GHA_RENDEZVOUS_ENDPOINT。"
