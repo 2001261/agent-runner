@@ -242,6 +242,13 @@ jobs:
             printf '{}' > "$CFG"
           fi
           chmod 600 "$CFG"
+          # install-linux.sh 把 GHA_NOVNC_DIR / GHA_INTERACTIVE_VENV 写入 GITHUB_ENV；
+          # step env: 少给一个键会让整个追加文件被拒（job log 只有一句 warning），
+          # 后面的 Interactive 开关也就丢了。这里按脚本实际导出项把键补成全量。
+          {
+            echo "GHA_NOVNC_DIR=$(npm root -g)/@novnc/novnc"
+            echo "GHA_INTERACTIVE_VENV=$RUNNER_TEMP/gha-interactive-venv"
+          } >> "$GITHUB_ENV"
           echo "GHA_INTERACTIVE_CONFIG_FILE=$CFG" >> "$GITHUB_ENV"
           echo "GHA_INTERACTIVE_ENABLED=true" >> "$GITHUB_ENV"
           echo "DISPLAY=:99" >> "$GITHUB_ENV"
