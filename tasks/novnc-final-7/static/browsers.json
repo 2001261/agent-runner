@@ -1,0 +1,65 @@
+{
+  "schema": "gha-selftest-static/v3",
+  "novnc": {
+    "package": "@novnc/novnc@1.7.0"
+  },
+  "npm": {
+    "package": "jsdom@25.0.1"
+  },
+  "browser": {
+    "platform": "linux-x64",
+    "playwright_build": "1187",
+    "revision": "1187",
+    "chromium_version": "140.0.7339.16"
+  },
+  "dirs": {
+    "chromium": "chromium-1187",
+    "headless_shell": "chromium_headless_shell-1187"
+  },
+  "executables": {
+    "chromium": {
+      "path": "chrome-linux/chrome",
+      "sha256": "2fa605e3639b8cfbe8037d0b8e0324dbf7f9e6ad7beb345374ecd26764e2d92b"
+    },
+    "headless_shell": {
+      "path": "chrome-linux/headless_shell",
+      "sha256": "a6bd350a143a92159c12291f336d2f3cc65ea501e521070d9ebb596c8c90a2a7"
+    }
+  },
+  "sources": {
+    "chromium": {
+      "urls": [
+        "https://cdn.playwright.dev/dbazure/download/playwright/builds/chromium/1187/chromium-linux.zip",
+        "https://playwright.download.prss.microsoft.com/dbazure/download/playwright/builds/chromium/1187/chromium-linux.zip",
+        "https://cdn.playwright.dev/builds/chromium/1187/chromium-linux.zip"
+      ],
+      "sha256": "395e829e88f9ff3fc108cc9a3db49907afd9f5860066e9678694b01a406ee979",
+      "size": 182166967
+    },
+    "headless_shell": {
+      "urls": [
+        "https://cdn.playwright.dev/dbazure/download/playwright/builds/chromium/1187/chromium-headless-shell-linux.zip",
+        "https://playwright.download.prss.microsoft.com/dbazure/download/playwright/builds/chromium/1187/chromium-headless-shell-linux.zip",
+        "https://cdn.playwright.dev/builds/chromium/1187/chromium-headless-shell-linux.zip"
+      ],
+      "sha256": "97842c43d49627e893e1498f61554fdfe0223d35daf247e4bedee11e79509b8e",
+      "size": 109363841
+    },
+    "novnc": {
+      "urls": [
+        "https://registry.npmjs.org/@novnc/novnc/-/novnc-1.7.0.tgz",
+        "https://registry.npmmirror.com/@novnc/novnc/-/novnc-1.7.0.tgz"
+      ],
+      "sha256": "32689f18d6abe96bc6530828a6bd0b9ae33bda07c083a6575ed255b5a8f2e903",
+      "size": 155185
+    },
+    "npm": {
+      "urls": [
+        "https://registry.npmjs.org/jsdom/-/jsdom-25.0.1.tgz",
+        "https://registry.npmmirror.com/jsdom/-/jsdom-25.0.1.tgz"
+      ],
+      "sha256": "8544ad13bdef5700bc8dee1443276b19bd37ae2c392ad0793ed9d8d1b64f19e7",
+      "size": 352636
+    }
+  }
+}
