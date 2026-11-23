@@ -50,9 +50,12 @@ on:
         type: string
         default: ""
 
-# 最小权限：只需要 checkout 读代码。推分支由本地 git 完成，不需要 contents:write。
+# 最小权限：checkout 读代码；checks: write 供 Interactive Runtime 把入口发布成
+# gha-rndz-<run_id> 的 Check Run（GitHub 原生 rendezvous，端点不进仓库 Secret）。
+# 推分支由本地 git 完成，不需要 contents:write。
 permissions:
   contents: read
+  checks: write
 
 jobs:
   run:
@@ -207,6 +210,11 @@ jobs:
         if: inputs.interactive
         env:
           IN_INTERACTIVE_CONFIG: ${{ inputs.interactive_config }}
+          # B 方案：GitHub 原生 rendezvous 用平台令牌把入口发布成 Check Run
+          #（gha-rndz-<run_id>）。runner 不会自动把 GITHUB_TOKEN 放进步骤环境
+          #（探针 run 45143867395 实测 absent），interactive 步骤显式注入；仅
+          # interactive 任务可见，Supervisor 发布后即从任务子进程环境中剥离。
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -uo pipefail
@@ -231,11 +239,23 @@ jobs:
             # 显式 turn_off_echo 关掉 xtrace：bash -x 调试时也不会把值打进步骤日志。
             CREDINJECT="$GHA_TASK_DIR/_gha/credinject.py"
             turn_off_echo() { case $- in *x*) set +x; return 0;; esac; return 1; }
-            eval "$("$PYCFG" "$CREDINJECT" --emit-export)"
+            if [ -n "${GHA_TASK_SECRETS:-}" ]; then
+              CREDS="$("$PYCFG" "$CREDINJECT" --emit-export)"
+              if [ -n "$CREDS" ]; then eval "$CREDS"; fi
+              unset CREDS
+            fi
             if turn_off_echo; then set -x; fi
           fi
-          if [ -z "$GHA_RENDEZVOUS_ENDPOINT" ] && [ -z "${GHA_TUNNEL_HOSTNAME:-}" ]; then
-            echo "::error::未配置私有 Rendezvous：Quick Tunnel 必须在 GHA_TASK_SECRETS 中提供 GHA_RENDEZVOUS_ENDPOINT。"
+          # 入口发布通道二选一：旧路径走 Secret 注入的私有 Registry；默认路径走 GitHub
+          # 原生 Check Run（只需平台自带的 GITHUB_TOKEN + 任务包里的 Host 公钥，无仓库 Secret）。
+          # 三键是否齐全由下面的预检逐项 fail-closed，这里只兜“两样都没配”的提示。
+          gh_pubkey="${GHA_STATE_PUBLIC_KEY:-}"
+          if [ -f "$GHA_TASK_DIR/_gha/state-recipient.json" ]; then
+            gh_pubkey="$(sed -n 's/.*"public_key"[[:space:]]*:.*/present/p' "$GHA_TASK_DIR/_gha/state-recipient.json" | head -n 1)"
+          fi
+          if [ -z "${GHA_RENDEZVOUS_ENDPOINT:-}" ] && [ -z "${GHA_TUNNEL_HOSTNAME:-}" ] \
+             && { [ -z "${GITHUB_ACTIONS:-}" ] || [ -z "${GITHUB_TOKEN:-}" ] || [ -z "$gh_pubkey" ]; }; then
+            echo "::error::未配置入口发布通道：Quick Tunnel 需要 GHA_TASK_SECRETS 中的 GHA_RENDEZVOUS_ENDPOINT，或 GitHub Check Run 通道（GITHUB_ACTIONS=true + GITHUB_TOKEN + 任务包 Host 公钥）。"
             exit 1
           fi
           bash "$GHA_TASK_DIR/_gha_runtime/interactive_runtime/setup/install-linux.sh"
@@ -264,6 +284,11 @@ jobs:
 
       - name: Run task
         id: task
+        env:
+          # interactive 时把平台令牌交给 Runtime 进程发布 Check Run（Setup 步骤的
+          # env 不跨步骤）；非 interactive 为空串，任务环境不可见。Supervisor 发布
+          # 后即剥离，任务子进程拿不到（见 interactive_runtime/supervisor.py）。
+          GITHUB_TOKEN: ${{ inputs.interactive && secrets.GITHUB_TOKEN || '' }}
         shell: bash
         run: |
           # 关键：声明了 shell: bash 后，GitHub 是用 `bash --noprofile --norc -e -o pipefail`
