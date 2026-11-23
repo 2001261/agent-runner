@@ -228,9 +228,11 @@ jobs:
             exit 1
           fi
           # 先做配置与平台预检，再安装大型依赖，避免无效部署。
-          # Registry URL 也只允许从 Secret 注入，禁止经 Workflow Inputs 公开。
+          # Registry 模式（旧路径）必须由 --secret / secrets.txt 声明后由 credinject 注入；
+          # 这里不再直读 GHA_TASK_SECRETS blob —— 陈旧 Secret 里的旧端点会污染预检判定。
+          # 本地调试可经 interactive_config 的 rendezvous.endpoint 显式给出。
           PYCFG="${GHA_PYBIN:-python3}"
-          export GHA_RENDEZVOUS_ENDPOINT="$($PYCFG -c 'import json,os; cfg=json.loads(os.environ.get("IN_INTERACTIVE_CONFIG") or "{}"); blob=json.loads(os.environ.get("GHA_TASK_SECRETS") or "{}"); print(blob.get("GHA_RENDEZVOUS_ENDPOINT") or cfg.get("rendezvous", {}).get("endpoint", ""))' 2>/dev/null || true)"
+          export GHA_RENDEZVOUS_ENDPOINT="$($PYCFG -c 'import json,os; cfg=json.loads(os.environ.get("IN_INTERACTIVE_CONFIG") or "{}"); print(cfg.get("rendezvous", {}).get("endpoint", ""))' 2>/dev/null || true)"
           if [ -f "$GHA_TASK_DIR/_gha/credinject.py" ]; then
             "$PYCFG" "$GHA_TASK_DIR/_gha/credinject.py" --mask-only
             # 预检（verify.sh）直接读 env 判断凭证是否“已注入”，而注入发生在 Run task
